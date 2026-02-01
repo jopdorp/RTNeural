@@ -77,14 +77,6 @@ public:
         for (int i = 0; i < v_io_size; ++i)
             state[state_ptr][i] = ins[i];
 
-        // Set state pointers
-        setStatePointers();
-
-        // Copy relevant columns for convolution
-        for (int k = 0; k < kernel_size; ++k)
-            for (int i = 0; i < v_io_size; ++i)
-                state_cols[k][i] = state[state_ptrs[k]][i];
-
         // Fused convolution + bias + activation + residual
         for (int i = 0; i < v_io_size; ++i)
         {
@@ -92,11 +84,12 @@ public:
 
             for (int k = 0; k < kernel_size; ++k)
             {
+                // Branchless state index computation (no modulo)
+                int idx = state_ptr - k * dilation_rate;
+                idx += (idx < 0) * state_size;
+
                 for (int j = 0; j < v_io_size; ++j)
-                {
-                    // Element-wise multiply and accumulate
-                    conv_out += weights[i][k][j] * state_cols[k][j];
-                }
+                    conv_out += weights[i][k][j] * state[idx][j];
             }
 
             v_type activated = applyActivation(conv_out);
@@ -110,23 +103,83 @@ public:
                 skip_outs[i] += activated;
         }
 
-        state_ptr = (state_ptr == state_size - 1 ? 0 : state_ptr + 1);
+        // Advance state pointer (branchless wrap)
+        ++state_ptr;
+        state_ptr -= (state_ptr >= state_size) * state_size;
     }
 
+    /**
+     * True block-based forward propagation.
+     * Processes block_size samples in a fused kernel.
+     */
     RTNEURAL_REALTIME inline void forwardBlock(const T* ins, T* output) noexcept
     {
-        v_type sample_in[v_io_size];
-
+        // Precompute state indices for the entire block
+        int state_indices[block_size][kernel_size];
+        int cur_ptr = state_ptr;
         for (int sample = 0; sample < block_size; ++sample)
         {
-            for (int i = 0; i < v_io_size; ++i)
-                sample_in[i] = xsimd::load_aligned(ins + sample * in_size + i * v_size);
-
-            forward(sample_in);
-
-            for (int i = 0; i < v_io_size; ++i)
-                xsimd::store_aligned(output + sample * out_size + i * v_size, outs[i]);
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                int idx = cur_ptr - k * dilation_rate;
+                idx += (idx < 0) * state_size;
+                state_indices[sample][k] = idx;
+            }
+            ++cur_ptr;
+            cur_ptr -= (cur_ptr >= state_size) * state_size;
         }
+
+        // Process all samples
+        cur_ptr = state_ptr;
+        for (int sample = 0; sample < block_size; ++sample)
+        {
+            const T* in_ptr = ins + sample * in_size;
+            T* out_ptr = output + sample * out_size;
+
+            // Load input using unaligned load (input buffer not guaranteed aligned)
+            v_type sample_in[v_io_size];
+            for (int i = 0; i < v_io_size; ++i)
+                sample_in[i] = xsimd::load_unaligned(in_ptr + i * v_size);
+
+            // Store input in circular buffer
+            for (int i = 0; i < v_io_size; ++i)
+                state[cur_ptr][i] = sample_in[i];
+
+            // Fused convolution + bias + activation + residual
+            for (int i = 0; i < v_io_size; ++i)
+            {
+                v_type conv_out = bias[i];
+
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    const int idx = state_indices[sample][k];
+                    for (int j = 0; j < v_io_size; ++j)
+                        conv_out += weights[i][k][j] * state[idx][j];
+                }
+
+                v_type activated = applyActivation(conv_out);
+
+                v_type out_val;
+                if (has_residual)
+                    out_val = sample_in[i] + activated;
+                else
+                    out_val = activated;
+
+                // Store output using unaligned store
+                xsimd::store_unaligned(out_ptr + i * v_size, out_val);
+                outs[i] = out_val;
+
+                if (has_skip)
+                    skip_outs[i] += activated;
+            }
+
+            // Advance state pointer (branchless wrap)
+            ++cur_ptr;
+            cur_ptr -= (cur_ptr >= state_size) * state_size;
+        }
+
+        // Update state pointer
+        state_ptr = cur_ptr;
     }
 
     RTNEURAL_REALTIME void resetSkip() noexcept
@@ -170,8 +223,6 @@ public:
 
 private:
     v_type state[state_size][v_io_size];
-    v_type state_cols[kernel_size][v_io_size];
-    int state_ptrs[kernel_size];
     int state_ptr = 0;
 
     v_type weights[v_io_size][kernel_size][v_io_size];
@@ -192,12 +243,6 @@ private:
         default:
             return xsimd::tanh(x);
         }
-    }
-
-    RTNEURAL_REALTIME inline void setStatePointers()
-    {
-        for (int k = 0; k < kernel_size; ++k)
-            state_ptrs[k] = (state_ptr + state_size - k * dilation_rate) % state_size;
     }
 };
 
@@ -271,19 +316,22 @@ public:
         {
             const int dilation = getDilationRate(layer);
             const int layer_state_size = getStateSize(dilation);
+            const int cur_ptr = state_ptrs[layer];
 
             // Store input in layer's circular buffer
             for (int i = 0; i < v_channel_size; ++i)
-                states[layer][state_ptrs[layer]][i] = x[i];
+                states[layer][cur_ptr][i] = x[i];
 
-            // Compute convolution
+            // Compute convolution with branchless index computation
             v_type conv_out[v_channel_size];
             for (int i = 0; i < v_channel_size; ++i)
                 conv_out[i] = biases[layer][i];
 
             for (int k = 0; k < kernel_size; ++k)
             {
-                int idx = (state_ptrs[layer] + layer_state_size - k * dilation) % layer_state_size;
+                // Branchless state index (no modulo)
+                int idx = cur_ptr - k * dilation;
+                idx += (idx < 0) * layer_state_size;
 
                 for (int i = 0; i < v_channel_size; ++i)
                     for (int j = 0; j < v_channel_size; ++j)
@@ -298,27 +346,87 @@ public:
                 x[i] += activated;
             }
 
-            // Advance state pointer
-            state_ptrs[layer] = (state_ptrs[layer] == layer_state_size - 1 ? 0 : state_ptrs[layer] + 1);
+            // Advance state pointer (branchless wrap)
+            int new_ptr = cur_ptr + 1;
+            new_ptr -= (new_ptr >= layer_state_size) * layer_state_size;
+            state_ptrs[layer] = new_ptr;
         }
 
         for (int i = 0; i < v_channel_size; ++i)
             outs[i] = skip_sum[i];
     }
 
+    /**
+     * True block-based forward propagation.
+     * Processes block_size samples in a fused kernel without calling forward().
+     */
     RTNEURAL_REALTIME inline void forwardBlock(const T* ins, T* output) noexcept
     {
-        v_type sample_in[v_channel_size];
-
+        // Process each sample through all layers
         for (int sample = 0; sample < block_size; ++sample)
         {
-            for (int i = 0; i < v_channel_size; ++i)
-                sample_in[i] = xsimd::load_aligned(ins + sample * in_size + i * v_size);
+            const T* in_ptr = ins + sample * in_size;
+            T* out_ptr = output + sample * out_size;
 
-            forward(sample_in);
-
+            // Load input using unaligned load
+            v_type sample_in[v_channel_size];
             for (int i = 0; i < v_channel_size; ++i)
-                xsimd::store_aligned(output + sample * out_size + i * v_size, outs[i]);
+                sample_in[i] = xsimd::load_unaligned(in_ptr + i * v_size);
+
+            // Reset skip sum for this sample
+            for (int i = 0; i < v_channel_size; ++i)
+                skip_sum[i] = v_type((T)0);
+
+            v_type x[v_channel_size];
+            for (int i = 0; i < v_channel_size; ++i)
+                x[i] = sample_in[i];
+
+            // Process all layers
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                const int dilation = getDilationRate(layer);
+                const int layer_state_size = getStateSize(dilation);
+                const int cur_ptr = state_ptrs[layer];
+
+                // Store x in layer's circular buffer
+                for (int i = 0; i < v_channel_size; ++i)
+                    states[layer][cur_ptr][i] = x[i];
+
+                // Compute convolution with branchless index computation
+                v_type conv_out[v_channel_size];
+                for (int i = 0; i < v_channel_size; ++i)
+                    conv_out[i] = biases[layer][i];
+
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    int idx = cur_ptr - k * dilation;
+                    idx += (idx < 0) * layer_state_size;
+
+                    for (int i = 0; i < v_channel_size; ++i)
+                        for (int j = 0; j < v_channel_size; ++j)
+                            conv_out[i] += weights[layer][k][i][j] * states[layer][idx][j];
+                }
+
+                // Fused activation + residual + skip
+                for (int i = 0; i < v_channel_size; ++i)
+                {
+                    v_type activated = applyActivation(conv_out[i]);
+                    skip_sum[i] += activated;
+                    x[i] += activated;
+                }
+
+                // Advance state pointer (branchless wrap)
+                int new_ptr = cur_ptr + 1;
+                new_ptr -= (new_ptr >= layer_state_size) * layer_state_size;
+                state_ptrs[layer] = new_ptr;
+            }
+
+            // Write output (skip sum) using unaligned store
+            for (int i = 0; i < v_channel_size; ++i)
+            {
+                xsimd::store_unaligned(out_ptr + i * v_size, skip_sum[i]);
+                outs[i] = skip_sum[i];
+            }
         }
     }
 

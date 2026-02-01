@@ -57,7 +57,6 @@ class WaveNetLayerT
 {
     using vec_type = Eigen::Vector<T, in_sizet>;
     using weights_type = Eigen::Matrix<T, in_sizet, kernel_size>;
-    using state_ptrs_type = Eigen::Vector<int, kernel_size>;
 
 public:
     static constexpr auto in_size = in_sizet;
@@ -100,17 +99,18 @@ public:
         // Store input in circular buffer
         state.col(state_ptr) = ins;
 
-        // Set state pointers for this sample
-        setStatePointers();
-
-        // Copy relevant columns for convolution
-        for (int k = 0; k < kernel_size; ++k)
-            state_cols.col(k) = state.col(state_ptrs(k));
-
         // Fused convolution + bias + activation + residual
         for (int i = 0; i < out_size; ++i)
         {
-            T conv_out = state_cols.cwiseProduct(weights[i]).sum() + bias(i);
+            T conv_out = bias(i);
+
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                // Branchless state index computation (no modulo)
+                int idx = state_ptr - k * dilation_rate;
+                idx += (idx < 0) * state_size;
+                conv_out += state.col(idx).cwiseProduct(weights[i].col(k)).sum();
+            }
 
             T activated = applyActivation(conv_out);
 
@@ -125,13 +125,14 @@ public:
                 skip_outs(i) += activated;
         }
 
-        // Advance state pointer
-        state_ptr = (state_ptr == state_size - 1 ? 0 : state_ptr + 1);
+        // Advance state pointer (branchless wrap)
+        ++state_ptr;
+        state_ptr -= (state_ptr >= state_size) * state_size;
     }
 
     /**
-     * Performs block-based forward propagation.
-     * Processes WAVENET_BLOCK_SIZE samples at once for improved performance.
+     * True block-based forward propagation.
+     * Processes WAVENET_BLOCK_SIZE samples in a fused kernel.
      *
      * @param ins Input samples [in_size x block_size]
      * @param output Output samples [out_size x block_size]
@@ -140,25 +141,41 @@ public:
         const T* ins,
         T* output) noexcept
     {
+        // Precompute state indices for the entire block
+        int state_indices[block_size][kernel_size];
+        int cur_ptr = state_ptr;
+        for (int sample = 0; sample < block_size; ++sample)
+        {
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                int idx = cur_ptr - k * dilation_rate;
+                idx += (idx < 0) * state_size;
+                state_indices[sample][k] = idx;
+            }
+            ++cur_ptr;
+            cur_ptr -= (cur_ptr >= state_size) * state_size;
+        }
+
+        // Process all samples
+        cur_ptr = state_ptr;
         for (int sample = 0; sample < block_size; ++sample)
         {
             // Map input sample
             Eigen::Map<const Eigen::Matrix<T, in_size, 1>> in_vec(ins + sample * in_size);
 
             // Store input in circular buffer
-            state.col(state_ptr) = in_vec;
-
-            // Set state pointers for this sample
-            setStatePointers();
-
-            // Copy relevant columns for convolution
-            for (int k = 0; k < kernel_size; ++k)
-                state_cols.col(k) = state.col(state_ptrs(k));
+            state.col(cur_ptr) = in_vec;
 
             // Fused convolution + bias + activation + residual
             for (int i = 0; i < out_size; ++i)
             {
-                T conv_out = state_cols.cwiseProduct(weights[i]).sum() + bias(i);
+                T conv_out = bias(i);
+
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    const int idx = state_indices[sample][k];
+                    conv_out += state.col(idx).cwiseProduct(weights[i].col(k)).sum();
+                }
 
                 T activated = applyActivation(conv_out);
 
@@ -173,11 +190,13 @@ public:
                     skip_outs(i) += activated;
             }
 
-            // Advance state pointer
-            state_ptr = (state_ptr == state_size - 1 ? 0 : state_ptr + 1);
+            // Advance state pointer (branchless wrap)
+            ++cur_ptr;
+            cur_ptr -= (cur_ptr >= state_size) * state_size;
         }
 
-        // Update outs with the last sample's output
+        // Update state pointer and outs from last sample
+        state_ptr = cur_ptr;
         for (int i = 0; i < out_size; ++i)
             outs(i) = output[(block_size - 1) * out_size + i];
     }
@@ -242,10 +261,8 @@ private:
     T skip_internal alignas(RTNEURAL_DEFAULT_ALIGNMENT)[out_size];
 
     Eigen::Matrix<T, in_size, state_size> state;
-    weights_type state_cols;
 
     int state_ptr = 0;
-    state_ptrs_type state_ptrs;
 
     weights_type weights[out_size];
     vec_type bias;
@@ -268,13 +285,6 @@ private:
         default:
             return std::tanh(x);
         }
-    }
-
-    /** Sets pointers to state array columns. */
-    RTNEURAL_REALTIME inline void setStatePointers()
-    {
-        for (int k = 0; k < kernel_size; ++k)
-            state_ptrs[k] = (state_ptr + state_size - k * dilation_rate) % state_size;
     }
 };
 
@@ -358,60 +368,104 @@ public:
         {
             const int dilation = getDilationRate(layer);
             const int layer_state_size = getStateSize(dilation);
+            const int cur_ptr = state_ptrs[layer];
 
             // Store input in layer's circular buffer
-            states[layer].col(state_ptrs[layer]) = x;
+            states[layer].col(cur_ptr) = x;
 
-            // Compute convolution
-            Eigen::Matrix<T, channel_size, 1> conv_out;
-            conv_out.setZero();
+            // Compute convolution with branchless index computation
+            Eigen::Matrix<T, channel_size, 1> conv_out = biases[layer];
 
             for (int k = 0; k < kernel_size; ++k)
             {
-                int idx = (state_ptrs[layer] + layer_state_size - k * dilation) % layer_state_size;
+                // Branchless state index (no modulo)
+                int idx = cur_ptr - k * dilation;
+                idx += (idx < 0) * layer_state_size;
                 conv_out += weights[layer][k] * states[layer].col(idx);
             }
-
-            conv_out += biases[layer];
 
             // Apply activation and residual
             for (int i = 0; i < channel_size; ++i)
             {
                 T activated = applyActivation(conv_out(i));
                 skip_sum(i) += activated;
-                x(i) = x(i) + activated; // Residual connection
+                x(i) += activated; // Residual connection
             }
 
-            // Advance state pointer
-            state_ptrs[layer] = (state_ptrs[layer] == layer_state_size - 1 ? 0 : state_ptrs[layer] + 1);
+            // Advance state pointer (branchless wrap)
+            int new_ptr = cur_ptr + 1;
+            new_ptr -= (new_ptr >= layer_state_size) * layer_state_size;
+            state_ptrs[layer] = new_ptr;
         }
 
-        // Output is the skip sum (or last layer output depending on architecture)
+        // Output is the skip sum
         for (int i = 0; i < out_size; ++i)
             outs_internal[i] = skip_sum(i);
     }
 
     /**
-     * Performs block-based forward propagation for improved performance.
+     * True block-based forward propagation.
+     * Processes block_size samples in a fused kernel without calling forward().
      *
-     * @param ins Input samples [in_size x block_size], stored as [sample0_ch0, sample0_ch1, ..., sample1_ch0, ...]
+     * @param ins Input samples [in_size x block_size]
      * @param output Output samples [out_size x block_size]
      */
     RTNEURAL_REALTIME inline void forwardBlock(
         const T* ins,
         T* output) noexcept
     {
+        // Process each sample through all layers
         for (int sample = 0; sample < block_size; ++sample)
         {
             // Map input sample
             Eigen::Map<const Eigen::Matrix<T, in_size, 1>> in_vec(ins + sample * in_size);
 
-            forward(in_vec);
+            // Reset skip sum for this sample
+            skip_sum.setZero();
+            Eigen::Matrix<T, channel_size, 1> x = in_vec;
 
-            // Copy output
+            // Process all layers
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                const int dilation = getDilationRate(layer);
+                const int layer_state_size = getStateSize(dilation);
+                const int cur_ptr = state_ptrs[layer];
+
+                // Store x in layer's circular buffer
+                states[layer].col(cur_ptr) = x;
+
+                // Compute convolution with branchless index computation
+                Eigen::Matrix<T, channel_size, 1> conv_out = biases[layer];
+
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    int idx = cur_ptr - k * dilation;
+                    idx += (idx < 0) * layer_state_size;
+                    conv_out += weights[layer][k] * states[layer].col(idx);
+                }
+
+                // Fused activation + residual + skip
+                for (int i = 0; i < channel_size; ++i)
+                {
+                    T activated = applyActivation(conv_out(i));
+                    skip_sum(i) += activated;
+                    x(i) += activated;
+                }
+
+                // Advance state pointer (branchless wrap)
+                int new_ptr = cur_ptr + 1;
+                new_ptr -= (new_ptr >= layer_state_size) * layer_state_size;
+                state_ptrs[layer] = new_ptr;
+            }
+
+            // Write output (skip sum)
             for (int i = 0; i < out_size; ++i)
-                output[sample * out_size + i] = outs_internal[i];
+                output[sample * out_size + i] = skip_sum(i);
         }
+
+        // Update outs_internal from last sample
+        for (int i = 0; i < out_size; ++i)
+            outs_internal[i] = output[(block_size - 1) * out_size + i];
     }
 
     /**

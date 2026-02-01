@@ -443,4 +443,107 @@ TEST(TestWaveNetComparison, waveNetLayerMatchesConv1DForConvolution)
     }
 }
 
+/**
+ * Test that forwardBlock() produces identical output to repeated forward() calls
+ * with various dilation rates. This is the key correctness test for the block
+ * optimization.
+ */
+TEST(TestWaveNetComparison, forwardBlockMatchesForwardWithVariousDilations)
+{
+    constexpr int block_size = WAVENET_BLOCK_SIZE;
+    constexpr int channels = 4;
+    constexpr int kernel = 3;
+
+    // Test dilation rates 1, 2, 4, 8
+    auto test_dilation = [](auto sample_layer_ptr, auto block_layer_ptr, int dilation) {
+        auto& sample_layer = *sample_layer_ptr;
+        auto& block_layer = *block_layer_ptr;
+
+        // Set random-ish weights
+        std::vector<std::vector<std::vector<TestType>>> weights(channels);
+        for (int i = 0; i < channels; ++i)
+        {
+            weights[i].resize(channels);
+            for (int j = 0; j < channels; ++j)
+            {
+                weights[i][j].resize(kernel);
+                for (int k = 0; k < kernel; ++k)
+                {
+                    weights[i][j][k] = 0.1 * std::sin(i * 1.1 + j * 0.7 + k * 0.3 + dilation * 0.5);
+                }
+            }
+        }
+        sample_layer.setWeights(weights);
+        block_layer.setWeights(weights);
+
+        std::vector<TestType> biases(channels);
+        for (int i = 0; i < channels; ++i)
+            biases[i] = 0.05 * std::cos(i * 0.9 + dilation * 0.2);
+        sample_layer.setBias(biases);
+        block_layer.setBias(biases);
+
+        sample_layer.reset();
+        block_layer.reset();
+
+        // Create input block
+        std::vector<TestType> input_block(block_size * channels);
+        for (int s = 0; s < block_size; ++s)
+        {
+            for (int c = 0; c < channels; ++c)
+            {
+                input_block[s * channels + c] = 0.5 * std::sin(s * 0.2 + c * 0.3 + dilation * 0.1);
+            }
+        }
+
+        // Process per-sample
+        std::vector<TestType> sample_output(block_size * channels);
+        for (int s = 0; s < block_size; ++s)
+        {
+            Eigen::Map<const Eigen::Matrix<TestType, channels, 1>> in_vec(input_block.data() + s * channels);
+            sample_layer.forward(in_vec);
+            for (int c = 0; c < channels; ++c)
+                sample_output[s * channels + c] = sample_layer.outs(c);
+        }
+
+        // Process block
+        std::vector<TestType> block_output(block_size * channels);
+        block_layer.forwardBlock(input_block.data(), block_output.data());
+
+        // Compare outputs
+        for (int i = 0; i < block_size * channels; ++i)
+        {
+            EXPECT_NEAR(block_output[i], sample_output[i], 1e-10)
+                << "Mismatch at index " << i << " with dilation " << dilation;
+        }
+    };
+
+    // Test dilation 1
+    {
+        WaveNetLayerT<TestType, channels, kernel, 1, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, kernel, 1, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(&sample_layer, &block_layer, 1);
+    }
+
+    // Test dilation 2
+    {
+        WaveNetLayerT<TestType, channels, kernel, 2, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, kernel, 2, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(&sample_layer, &block_layer, 2);
+    }
+
+    // Test dilation 4
+    {
+        WaveNetLayerT<TestType, channels, kernel, 4, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, kernel, 4, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(&sample_layer, &block_layer, 4);
+    }
+
+    // Test dilation 8
+    {
+        WaveNetLayerT<TestType, channels, kernel, 8, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, kernel, 8, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(&sample_layer, &block_layer, 8);
+    }
+}
+
 } // namespace
