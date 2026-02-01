@@ -1,5 +1,0 @@
-/home/runner/work/RTNeural/RTNeural/_codeql_build_dir/CMakeFiles/edit_cache.dir
-/home/runner/work/RTNeural/RTNeural/_codeql_build_dir/CMakeFiles/rebuild_cache.dir
-/home/runner/work/RTNeural/RTNeural/_codeql_build_dir/RTNeural/CMakeFiles/RTNeural.dir
-/home/runner/work/RTNeural/RTNeural/_codeql_build_dir/RTNeural/CMakeFiles/edit_cache.dir
-/home/runner/work/RTNeural/RTNeural/_codeql_build_dir/RTNeural/CMakeFiles/rebuild_cache.dir
