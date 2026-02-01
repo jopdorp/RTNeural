@@ -275,7 +275,7 @@ public:
             {
                 T activated = applyActivation(conv_out[i]);
                 skip_sum[i] += activated;
-                x[i] = x[i] + activated;
+                x[i] += activated;
             }
 
             // Advance state pointer

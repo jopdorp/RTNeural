@@ -107,7 +107,7 @@ public:
                 outs[i] = activated;
 
             if (has_skip)
-                skip_outs[i] = skip_outs[i] + activated;
+                skip_outs[i] += activated;
         }
 
         state_ptr = (state_ptr == state_size - 1 ? 0 : state_ptr + 1);
@@ -287,15 +287,15 @@ public:
 
                 for (int i = 0; i < v_channel_size; ++i)
                     for (int j = 0; j < v_channel_size; ++j)
-                        conv_out[i] = conv_out[i] + weights[layer][k][i][j] * states[layer][idx][j];
+                        conv_out[i] += weights[layer][k][i][j] * states[layer][idx][j];
             }
 
             // Apply activation and residual
             for (int i = 0; i < v_channel_size; ++i)
             {
                 v_type activated = applyActivation(conv_out[i]);
-                skip_sum[i] = skip_sum[i] + activated;
-                x[i] = x[i] + activated;
+                skip_sum[i] += activated;
+                x[i] += activated;
             }
 
             // Advance state pointer
