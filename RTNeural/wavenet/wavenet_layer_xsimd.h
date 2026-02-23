@@ -6,6 +6,7 @@
 #include "../config.h"
 #include <array>
 #include <cmath>
+#include <numeric>
 
 namespace RTNEURAL_NAMESPACE
 {
@@ -28,6 +29,9 @@ enum class WaveNetActivation
 
 /**
  * Static implementation of a fused WaveNet layer for NAM models (XSIMD backend).
+ *
+ * Uses per-output-channel weight storage with inner_product + reduce_add
+ * for correct SIMD matrix-vector multiplication (matching Conv1DT pattern).
  */
 template <typename T,
     int in_sizet,
@@ -50,6 +54,14 @@ public:
 
     WaveNetLayerT()
     {
+        for (int i = 0; i < out_size; ++i)
+            for (int k = 0; k < kernel_size; ++k)
+                for (int j = 0; j < v_io_size; ++j)
+                    weights[i][k][j] = v_type((T)0);
+
+        for (int i = 0; i < v_io_size; ++i)
+            bias[i] = v_type((T)0);
+
         reset();
     }
 
@@ -78,20 +90,27 @@ public:
             state[state_ptr][i] = ins[i];
 
         // Fused convolution + bias + activation + residual
+        // Per-output-channel matmul using inner_product + reduce_add
         for (int i = 0; i < v_io_size; ++i)
         {
-            v_type conv_out = bias[i];
-
-            for (int k = 0; k < kernel_size; ++k)
+            alignas(RTNEURAL_DEFAULT_ALIGNMENT) T out_sum[v_size] {};
+            for (int m = 0; m < v_size && (i * v_size + m) < out_size; ++m)
             {
-                // Branchless state index computation (no modulo)
-                int idx = state_ptr - k * dilation_rate;
-                idx += (idx < 0) * state_size;
+                const int out_ch = i * v_size + m;
+                T ch_sum = (T)0;
+                for (int k = 0; k < kernel_size; ++k)
+                {
+                    // Branchless state index computation (no modulo)
+                    int idx = state_ptr - k * dilation_rate;
+                    idx += (idx < 0) * state_size;
 
-                for (int j = 0; j < v_io_size; ++j)
-                    conv_out += weights[i][k][j] * state[idx][j];
+                    for (int j = 0; j < v_io_size; ++j)
+                        ch_sum += xsimd::reduce_add(weights[out_ch][k][j] * state[idx][j]);
+                }
+                out_sum[m] = ch_sum;
             }
 
+            v_type conv_out = xsimd::load_aligned(out_sum) + bias[i];
             v_type activated = applyActivation(conv_out);
 
             if (has_residual)
@@ -114,23 +133,8 @@ public:
      */
     RTNEURAL_REALTIME inline void forwardBlock(const T* ins, T* output) noexcept
     {
-        // Precompute state indices for the entire block
-        int state_indices[block_size][kernel_size];
-        int cur_ptr = state_ptr;
-        for (int sample = 0; sample < block_size; ++sample)
-        {
-            for (int k = 0; k < kernel_size; ++k)
-            {
-                int idx = cur_ptr - k * dilation_rate;
-                idx += (idx < 0) * state_size;
-                state_indices[sample][k] = idx;
-            }
-            ++cur_ptr;
-            cur_ptr -= (cur_ptr >= state_size) * state_size;
-        }
-
         // Process all samples
-        cur_ptr = state_ptr;
+        int cur_ptr = state_ptr;
         for (int sample = 0; sample < block_size; ++sample)
         {
             const T* in_ptr = ins + sample * in_size;
@@ -148,15 +152,24 @@ public:
             // Fused convolution + bias + activation + residual
             for (int i = 0; i < v_io_size; ++i)
             {
-                v_type conv_out = bias[i];
-
-                for (int k = 0; k < kernel_size; ++k)
+                alignas(RTNEURAL_DEFAULT_ALIGNMENT) T out_sum[v_size] {};
+                for (int m = 0; m < v_size && (i * v_size + m) < out_size; ++m)
                 {
-                    const int idx = state_indices[sample][k];
-                    for (int j = 0; j < v_io_size; ++j)
-                        conv_out += weights[i][k][j] * state[idx][j];
+                    const int out_ch = i * v_size + m;
+                    T ch_sum = (T)0;
+                    for (int k = 0; k < kernel_size; ++k)
+                    {
+                        // Branchless state index computation (no modulo)
+                        int idx = cur_ptr - k * dilation_rate;
+                        idx += (idx < 0) * state_size;
+
+                        for (int j = 0; j < v_io_size; ++j)
+                            ch_sum += xsimd::reduce_add(weights[out_ch][k][j] * state[idx][j]);
+                    }
+                    out_sum[m] = ch_sum;
                 }
 
+                v_type conv_out = xsimd::load_aligned(out_sum) + bias[i];
                 v_type activated = applyActivation(conv_out);
 
                 v_type out_val;
@@ -188,18 +201,20 @@ public:
             skip_outs[i] = v_type((T)0);
     }
 
+    /**
+     * Sets the layer weights.
+     * w[out_ch][in_ch][kernel_pos] — per-output-channel storage for correct matmul.
+     */
     RTNEURAL_REALTIME void setWeights(const std::vector<std::vector<std::vector<T>>>& w)
     {
         for (int i = 0; i < out_size; ++i)
         {
-            const int vi = i / v_size;
-            const int vi_off = i % v_size;
             for (int j = 0; j < in_size; ++j)
             {
-                const int vj = j / v_size;
                 for (int k = 0; k < kernel_size; ++k)
                 {
-                    weights[vi][k][vj] = set_value(weights[vi][k][vj], vi_off, w[i][j][k]);
+                    auto& wv = weights[i][k][j / v_size];
+                    wv = set_value(wv, j % v_size, w[i][j][k]);
                 }
             }
         }
@@ -225,7 +240,9 @@ private:
     v_type state[state_size][v_io_size];
     int state_ptr = 0;
 
-    v_type weights[v_io_size][kernel_size][v_io_size];
+    // Per-output-channel weight storage: weights[out_ch][kernel_pos][v_io_size]
+    // Each SIMD vector holds v_size input channel weights for one output channel.
+    v_type weights[out_size][kernel_size][v_io_size];
     v_type bias[v_io_size];
 
     RTNEURAL_REALTIME inline v_type applyActivation(v_type x) const noexcept
@@ -248,6 +265,9 @@ private:
 
 /**
  * Fused WaveNet block for NAM models (XSIMD backend).
+ *
+ * Uses per-output-channel weight storage with inner_product + reduce_add
+ * for correct SIMD matrix-vector multiplication (matching Conv1DT pattern).
  */
 template <typename T,
     int channel_size,
@@ -280,6 +300,16 @@ public:
 
     WaveNetBlockT()
     {
+        for (int layer = 0; layer < num_layers; ++layer)
+            for (int i = 0; i < channel_size; ++i)
+                for (int k = 0; k < kernel_size; ++k)
+                    for (int j = 0; j < v_channel_size; ++j)
+                        weights[layer][i][k][j] = v_type((T)0);
+
+        for (int layer = 0; layer < num_layers; ++layer)
+            for (int i = 0; i < v_channel_size; ++i)
+                biases[layer][i] = v_type((T)0);
+
         reset();
     }
 
@@ -322,26 +352,30 @@ public:
             for (int i = 0; i < v_channel_size; ++i)
                 states[layer][cur_ptr][i] = x[i];
 
-            // Compute convolution with branchless index computation
-            v_type conv_out[v_channel_size];
-            for (int i = 0; i < v_channel_size; ++i)
-                conv_out[i] = biases[layer][i];
-
-            for (int k = 0; k < kernel_size; ++k)
-            {
-                // Branchless state index (no modulo)
-                int idx = cur_ptr - k * dilation;
-                idx += (idx < 0) * layer_state_size;
-
-                for (int i = 0; i < v_channel_size; ++i)
-                    for (int j = 0; j < v_channel_size; ++j)
-                        conv_out[i] += weights[layer][k][i][j] * states[layer][idx][j];
-            }
-
-            // Apply activation and residual
+            // Compute convolution with per-output-channel matmul
             for (int i = 0; i < v_channel_size; ++i)
             {
-                v_type activated = applyActivation(conv_out[i]);
+                alignas(RTNEURAL_DEFAULT_ALIGNMENT) T out_sum[v_size] {};
+                for (int m = 0; m < v_size && (i * v_size + m) < channel_size; ++m)
+                {
+                    const int out_ch = i * v_size + m;
+                    T ch_sum = (T)0;
+                    for (int k = 0; k < kernel_size; ++k)
+                    {
+                        // Branchless state index (no modulo)
+                        int idx = cur_ptr - k * dilation;
+                        idx += (idx < 0) * layer_state_size;
+
+                        for (int j = 0; j < v_channel_size; ++j)
+                            ch_sum += xsimd::reduce_add(weights[layer][out_ch][k][j] * states[layer][idx][j]);
+                    }
+                    out_sum[m] = ch_sum;
+                }
+
+                v_type conv_out = xsimd::load_aligned(out_sum) + biases[layer][i];
+
+                // Apply activation and residual
+                v_type activated = applyActivation(conv_out);
                 skip_sum[i] += activated;
                 x[i] += activated;
             }
@@ -392,25 +426,29 @@ public:
                 for (int i = 0; i < v_channel_size; ++i)
                     states[layer][cur_ptr][i] = x[i];
 
-                // Compute convolution with branchless index computation
-                v_type conv_out[v_channel_size];
-                for (int i = 0; i < v_channel_size; ++i)
-                    conv_out[i] = biases[layer][i];
-
-                for (int k = 0; k < kernel_size; ++k)
-                {
-                    int idx = cur_ptr - k * dilation;
-                    idx += (idx < 0) * layer_state_size;
-
-                    for (int i = 0; i < v_channel_size; ++i)
-                        for (int j = 0; j < v_channel_size; ++j)
-                            conv_out[i] += weights[layer][k][i][j] * states[layer][idx][j];
-                }
-
-                // Fused activation + residual + skip
+                // Compute convolution with per-output-channel matmul
                 for (int i = 0; i < v_channel_size; ++i)
                 {
-                    v_type activated = applyActivation(conv_out[i]);
+                    alignas(RTNEURAL_DEFAULT_ALIGNMENT) T out_sum[v_size] {};
+                    for (int m = 0; m < v_size && (i * v_size + m) < channel_size; ++m)
+                    {
+                        const int out_ch = i * v_size + m;
+                        T ch_sum = (T)0;
+                        for (int k = 0; k < kernel_size; ++k)
+                        {
+                            int idx = cur_ptr - k * dilation;
+                            idx += (idx < 0) * layer_state_size;
+
+                            for (int j = 0; j < v_channel_size; ++j)
+                                ch_sum += xsimd::reduce_add(weights[layer][out_ch][k][j] * states[layer][idx][j]);
+                        }
+                        out_sum[m] = ch_sum;
+                    }
+
+                    v_type conv_out = xsimd::load_aligned(out_sum) + biases[layer][i];
+
+                    // Fused activation + residual + skip
+                    v_type activated = applyActivation(conv_out);
                     skip_sum[i] += activated;
                     x[i] += activated;
                 }
@@ -437,12 +475,10 @@ public:
 
         for (int i = 0; i < channel_size; ++i)
         {
-            const int vi = i / v_size;
-            const int vi_off = i % v_size;
             for (int j = 0; j < channel_size; ++j)
             {
-                const int vj = j / v_size;
-                weights[layer][kernel_pos][vi][vj] = set_value(weights[layer][kernel_pos][vi][vj], vi_off, w[i][j]);
+                auto& wv = weights[layer][i][kernel_pos][j / v_size];
+                wv = set_value(wv, j % v_size, w[i][j]);
             }
         }
     }
@@ -466,7 +502,8 @@ private:
     v_type states[num_layers][max_state_size][v_channel_size];
     int state_ptrs[num_layers];
 
-    v_type weights[num_layers][kernel_size][v_channel_size][v_channel_size];
+    // Per-output-channel weight storage: weights[layer][out_ch][kernel_pos][v_channel_size]
+    v_type weights[num_layers][channel_size][kernel_size][v_channel_size];
     v_type biases[num_layers][v_channel_size];
 
     v_type skip_sum[v_channel_size];

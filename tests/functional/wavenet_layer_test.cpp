@@ -10,6 +10,47 @@ using TestType = double;
 using namespace RTNeural;
 
 /**
+ * Helper to get a scalar output value from a WaveNetLayerT or WaveNetBlockT,
+ * abstracting over Eigen / XSIMD / STL backends.
+ */
+template <typename Layer>
+TestType getOut(const Layer& layer, int channel)
+{
+#if RTNEURAL_USE_EIGEN
+    return layer.outs(channel);
+#elif RTNEURAL_USE_XSIMD
+    using v_type = xsimd::simd_type<TestType>;
+    constexpr int v_size = (int)v_type::size;
+    return layer.outs[channel / v_size].get(channel % v_size);
+#else
+    return layer.outs[channel];
+#endif
+}
+
+/**
+ * Helper to call forward() on a WaveNetLayerT with a raw T array,
+ * abstracting over Eigen / XSIMD / STL backends.
+ */
+template <typename Layer, int N>
+void callForward(Layer& layer, const TestType (&input)[N])
+{
+#if RTNEURAL_USE_EIGEN
+    Eigen::Map<const Eigen::Matrix<TestType, N, 1>> in_vec(input);
+    layer.forward(in_vec);
+#elif RTNEURAL_USE_XSIMD
+    using v_type = xsimd::simd_type<TestType>;
+    constexpr int v_size = (int)v_type::size;
+    constexpr int v_io_size = ceil_div(N, v_size);
+    v_type ins[v_io_size] {};
+    for (int i = 0; i < N; ++i)
+        ins[i / v_size] = set_value(ins[i / v_size], i % v_size, input[i]);
+    layer.forward(ins);
+#else
+    layer.forward(input);
+#endif
+}
+
+/**
  * Test that WaveNetLayerT produces correct output for basic forward pass.
  */
 TEST(TestWaveNetLayer, singleLayerForwardProducesValidOutput)
@@ -43,16 +84,14 @@ TEST(TestWaveNetLayer, singleLayerForwardProducesValidOutput)
 
     layer.reset();
 
-    // Process a few samples to fill the state buffer
+    // Process a sample
     TestType input[4] = { 0.5, 0.3, -0.2, 0.1 };
-    Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> in_vec(input);
-
-    layer.forward(in_vec);
+    callForward<decltype(layer), 4>(layer, input);
 
     // With identity-like weights and tanh activation, output should be tanh(input)
     for (int i = 0; i < 4; ++i)
     {
-        EXPECT_NEAR(layer.outs(i), std::tanh(input[i]), 1e-10);
+        EXPECT_NEAR(getOut(layer, i), std::tanh(input[i]), 1e-10);
     }
 }
 
@@ -82,15 +121,13 @@ TEST(TestWaveNetLayer, residualConnectionAddsInputToOutput)
     layer.reset();
 
     TestType input[4] = { 0.5, 0.3, -0.2, 0.1 };
-    Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> in_vec(input);
-
-    layer.forward(in_vec);
+    callForward<decltype(layer), 4>(layer, input);
 
     // With zero weights and zero bias, conv output = 0, tanh(0) = 0
     // With residual, output = input + 0 = input
     for (int i = 0; i < 4; ++i)
     {
-        EXPECT_NEAR(layer.outs(i), input[i], 1e-10);
+        EXPECT_NEAR(getOut(layer, i), input[i], 1e-10);
     }
 }
 
@@ -126,15 +163,13 @@ TEST(TestWaveNetLayer, differentActivationFunctionsWork)
     relu_layer.reset();
 
     TestType input[4] = { 0.5, 0.3, -0.2, 0.1 };
-    Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> in_vec(input);
-
-    relu_layer.forward(in_vec);
+    callForward<decltype(relu_layer), 4>(relu_layer, input);
 
     // ReLU activation: max(0, x)
     for (int i = 0; i < 4; ++i)
     {
         TestType expected = input[i] > 0 ? input[i] : 0.0;
-        EXPECT_NEAR(relu_layer.outs(i), expected, 1e-10);
+        EXPECT_NEAR(getOut(relu_layer, i), expected, 1e-10);
     }
 }
 
@@ -167,13 +202,12 @@ TEST(TestWaveNetLayer, dilationAffectsConvolutionCorrectly)
     for (int s = 0; s < 10; ++s)
     {
         TestType input[2] = { (TestType)(s * 0.1), (TestType)(s * 0.05) };
-        Eigen::Map<const Eigen::Matrix<TestType, 2, 1>> in_vec(input);
-        layer.forward(in_vec);
+        callForward<decltype(layer), 2>(layer, input);
     }
 
     // Just verify the layer produces valid output without crashing
-    EXPECT_FALSE(std::isnan(layer.outs(0)));
-    EXPECT_FALSE(std::isnan(layer.outs(1)));
+    EXPECT_FALSE(std::isnan(getOut(layer, 0)));
+    EXPECT_FALSE(std::isnan(getOut(layer, 1)));
 }
 
 /**
@@ -182,16 +216,17 @@ TEST(TestWaveNetLayer, dilationAffectsConvolutionCorrectly)
 TEST(TestWaveNetLayer, blockInferenceMatchesPerSample)
 {
     constexpr int block_size = WAVENET_BLOCK_SIZE;
+    constexpr int channels = 4;
 
-    WaveNetLayerT<TestType, 4, 3, 1, WaveNetActivation::Tanh, true, false> sample_layer;
-    WaveNetLayerT<TestType, 4, 3, 1, WaveNetActivation::Tanh, true, false> block_layer;
+    WaveNetLayerT<TestType, channels, 3, 1, WaveNetActivation::Tanh, true, false> sample_layer;
+    WaveNetLayerT<TestType, channels, 3, 1, WaveNetActivation::Tanh, true, false> block_layer;
 
     // Set same weights for both
-    std::vector<std::vector<std::vector<TestType>>> weights(4);
-    for (int i = 0; i < 4; ++i)
+    std::vector<std::vector<std::vector<TestType>>> weights(channels);
+    for (int i = 0; i < channels; ++i)
     {
-        weights[i].resize(4);
-        for (int j = 0; j < 4; ++j)
+        weights[i].resize(channels);
+        for (int j = 0; j < channels; ++j)
         {
             weights[i][j].resize(3);
             for (int k = 0; k < 3; ++k)
@@ -211,31 +246,34 @@ TEST(TestWaveNetLayer, blockInferenceMatchesPerSample)
     block_layer.reset();
 
     // Create input block
-    std::vector<TestType> input_block(block_size * 4);
+    std::vector<TestType> input_block(block_size * channels);
     for (int s = 0; s < block_size; ++s)
     {
-        for (int c = 0; c < 4; ++c)
+        for (int c = 0; c < channels; ++c)
         {
-            input_block[s * 4 + c] = std::sin((TestType)(s * 0.1 + c * 0.2));
+            input_block[s * channels + c] = std::sin((TestType)(s * 0.1 + c * 0.2));
         }
     }
 
     // Process per-sample
-    std::vector<TestType> sample_output(block_size * 4);
+    std::vector<TestType> sample_output(block_size * channels);
     for (int s = 0; s < block_size; ++s)
     {
-        Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> in_vec(input_block.data() + s * 4);
-        sample_layer.forward(in_vec);
-        for (int c = 0; c < 4; ++c)
-            sample_output[s * 4 + c] = sample_layer.outs(c);
+        TestType input[channels];
+        for (int c = 0; c < channels; ++c)
+            input[c] = input_block[s * channels + c];
+
+        callForward<decltype(sample_layer), channels>(sample_layer, input);
+        for (int c = 0; c < channels; ++c)
+            sample_output[s * channels + c] = getOut(sample_layer, c);
     }
 
     // Process block
-    std::vector<TestType> block_output(block_size * 4);
+    std::vector<TestType> block_output(block_size * channels);
     block_layer.forwardBlock(input_block.data(), block_output.data());
 
     // Compare outputs
-    for (int i = 0; i < block_size * 4; ++i)
+    for (int i = 0; i < block_size * channels; ++i)
     {
         EXPECT_NEAR(block_output[i], sample_output[i], 1e-10)
             << "Mismatch at index " << i;
@@ -279,21 +317,20 @@ TEST(TestWaveNetBlock, multiLayerBlockProducesValidOutput)
     // Process multiple samples
     for (int s = 0; s < 20; ++s)
     {
-        TestType input_arr[4] = {
+        TestType input[4] = {
             (TestType)(0.5 * std::sin(s * 0.1)),
             (TestType)(0.3 * std::cos(s * 0.15)),
             (TestType)(0.2 * std::sin(s * 0.2)),
             (TestType)(0.1 * std::cos(s * 0.25))
         };
-        Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> input(input_arr);
 
-        block.forward(input);
+        callForward<decltype(block), 4>(block, input);
 
         // Verify output is valid
         for (int c = 0; c < 4; ++c)
         {
-            EXPECT_FALSE(std::isnan(block.outs(c))) << "NaN at sample " << s << ", channel " << c;
-            EXPECT_FALSE(std::isinf(block.outs(c))) << "Inf at sample " << s << ", channel " << c;
+            EXPECT_FALSE(std::isnan(getOut(block, c))) << "NaN at sample " << s << ", channel " << c;
+            EXPECT_FALSE(std::isinf(getOut(block, c))) << "Inf at sample " << s << ", channel " << c;
         }
     }
 }
@@ -304,19 +341,20 @@ TEST(TestWaveNetBlock, multiLayerBlockProducesValidOutput)
 TEST(TestWaveNetBlock, blockInferenceMatchesPerSample)
 {
     constexpr int block_size = WAVENET_BLOCK_SIZE;
+    constexpr int channels = 4;
 
-    WaveNetBlockT<TestType, 4, 3, 3, WaveNetActivation::Tanh> sample_block;
-    WaveNetBlockT<TestType, 4, 3, 3, WaveNetActivation::Tanh> block_block;
+    WaveNetBlockT<TestType, channels, 3, 3, WaveNetActivation::Tanh> sample_block;
+    WaveNetBlockT<TestType, channels, 3, 3, WaveNetActivation::Tanh> block_block;
 
     // Set same weights for both
     for (int layer = 0; layer < 3; ++layer)
     {
         for (int k = 0; k < 3; ++k)
         {
-            std::vector<std::vector<TestType>> w(4, std::vector<TestType>(4));
-            for (int i = 0; i < 4; ++i)
+            std::vector<std::vector<TestType>> w(channels, std::vector<TestType>(channels));
+            for (int i = 0; i < channels; ++i)
             {
-                for (int j = 0; j < 4; ++j)
+                for (int j = 0; j < channels; ++j)
                 {
                     w[i][j] = 0.05 * (layer + 1) * (i - j) / 4.0;
                 }
@@ -325,8 +363,8 @@ TEST(TestWaveNetBlock, blockInferenceMatchesPerSample)
             block_block.setLayerWeights(layer, k, w);
         }
 
-        std::vector<TestType> b(4);
-        for (int i = 0; i < 4; ++i)
+        std::vector<TestType> b(channels);
+        for (int i = 0; i < channels; ++i)
             b[i] = 0.01 * (layer + 1);
         sample_block.setLayerBias(layer, b);
         block_block.setLayerBias(layer, b);
@@ -336,36 +374,35 @@ TEST(TestWaveNetBlock, blockInferenceMatchesPerSample)
     block_block.reset();
 
     // Create input block
-    std::vector<TestType> input_block(block_size * 4);
+    std::vector<TestType> input_block(block_size * channels);
     for (int s = 0; s < block_size; ++s)
     {
-        for (int c = 0; c < 4; ++c)
+        for (int c = 0; c < channels; ++c)
         {
-            input_block[s * 4 + c] = 0.1 * std::sin((TestType)(s * 0.1 + c * 0.3));
+            input_block[s * channels + c] = 0.1 * std::sin((TestType)(s * 0.1 + c * 0.3));
         }
     }
 
     // Process per-sample
-    std::vector<TestType> sample_output(block_size * 4);
+    std::vector<TestType> sample_output(block_size * channels);
     for (int s = 0; s < block_size; ++s)
     {
-        TestType input_arr[4];
-        for (int c = 0; c < 4; ++c)
-            input_arr[c] = input_block[s * 4 + c];
-        Eigen::Map<const Eigen::Matrix<TestType, 4, 1>> input(input_arr);
+        TestType input[channels];
+        for (int c = 0; c < channels; ++c)
+            input[c] = input_block[s * channels + c];
 
-        sample_block.forward(input);
+        callForward<decltype(sample_block), channels>(sample_block, input);
 
-        for (int c = 0; c < 4; ++c)
-            sample_output[s * 4 + c] = sample_block.outs(c);
+        for (int c = 0; c < channels; ++c)
+            sample_output[s * channels + c] = getOut(sample_block, c);
     }
 
     // Process block
-    std::vector<TestType> block_output(block_size * 4);
+    std::vector<TestType> block_output(block_size * channels);
     block_block.forwardBlock(input_block.data(), block_output.data());
 
     // Compare outputs
-    for (int i = 0; i < block_size * 4; ++i)
+    for (int i = 0; i < block_size * channels; ++i)
     {
         EXPECT_NEAR(block_output[i], sample_output[i], 1e-10)
             << "Mismatch at index " << i;
@@ -373,17 +410,11 @@ TEST(TestWaveNetBlock, blockInferenceMatchesPerSample)
 }
 
 /**
- * Debug/test path: Compare WaveNetLayerT with standard Conv1DT for basic convolution.
- *
- * This test verifies that the WaveNet layer produces equivalent results to
- * the standard Conv1D layer for the convolution operation (before activation).
+ * Compare WaveNetLayerT with standard Conv1DT for basic convolution.
+ * Verifies that the WaveNet layer produces tanh(conv_output).
  */
 TEST(TestWaveNetComparison, waveNetLayerMatchesConv1DForConvolution)
 {
-    // We'll test that WaveNet layer (without activation, without residual)
-    // produces the same convolution result as Conv1DT when we manually
-    // apply the same transformation.
-
     constexpr int channels = 4;
     constexpr int kernel = 3;
     constexpr int dilation = 1;
@@ -391,7 +422,7 @@ TEST(TestWaveNetComparison, waveNetLayerMatchesConv1DForConvolution)
     // Create a standard Conv1D layer
     Conv1DT<TestType, channels, channels, kernel, dilation> conv_layer;
 
-    // Create a WaveNet layer with ReLU (linear for positive inputs)
+    // Create a WaveNet layer with Tanh
     WaveNetLayerT<TestType, channels, kernel, dilation, WaveNetActivation::Tanh, false, false> wavenet_layer;
 
     // Set identical weights
@@ -427,17 +458,43 @@ TEST(TestWaveNetComparison, waveNetLayerMatchesConv1DForConvolution)
         for (int c = 0; c < channels; ++c)
             input[c] = 0.3 * std::sin(s * 0.2 + c * 0.1);
 
+        // Forward conv layer
+#if RTNEURAL_USE_EIGEN
         Eigen::Map<const Eigen::Matrix<TestType, channels, 1>> in_vec(input);
-
         conv_layer.forward(in_vec);
-        wavenet_layer.forward(in_vec);
+#elif RTNEURAL_USE_XSIMD
+        {
+            using v_type = xsimd::simd_type<TestType>;
+            constexpr int v_size = (int)v_type::size;
+            constexpr int v_io_size = ceil_div(channels, v_size);
+            v_type ins[v_io_size] {};
+            for (int i = 0; i < channels; ++i)
+                ins[i / v_size] = set_value(ins[i / v_size], i % v_size, input[i]);
+            conv_layer.forward(ins);
+        }
+#else
+        conv_layer.forward(input);
+#endif
+
+        // Forward wavenet layer
+        callForward<decltype(wavenet_layer), channels>(wavenet_layer, input);
 
         // WaveNet applies tanh to convolution output
-        // Compare: wavenet_out = tanh(conv_out)
         for (int c = 0; c < channels; ++c)
         {
-            TestType expected = std::tanh(conv_layer.outs(c));
-            EXPECT_NEAR(wavenet_layer.outs(c), expected, 1e-10)
+#if RTNEURAL_USE_EIGEN
+            TestType conv_out = conv_layer.outs(c);
+#elif RTNEURAL_USE_XSIMD
+            {
+                using v_type = xsimd::simd_type<TestType>;
+                constexpr int v_size = (int)v_type::size;
+            }
+            TestType conv_out = conv_layer.outs[c / xsimd::simd_type<TestType>::size].get(c % xsimd::simd_type<TestType>::size);
+#else
+            TestType conv_out = conv_layer.outs[c];
+#endif
+            TestType expected = std::tanh(conv_out);
+            EXPECT_NEAR(getOut(wavenet_layer, c), expected, 1e-10)
                 << "Mismatch at sample " << s << ", channel " << c;
         }
     }
@@ -452,13 +509,8 @@ TEST(TestWaveNetComparison, forwardBlockMatchesForwardWithVariousDilations)
 {
     constexpr int block_size = WAVENET_BLOCK_SIZE;
     constexpr int channels = 4;
-    constexpr int kernel = 3;
 
-    // Test dilation rates 1, 2, 4, 8
-    auto test_dilation = [](auto sample_layer_ptr, auto block_layer_ptr, int dilation) {
-        auto& sample_layer = *sample_layer_ptr;
-        auto& block_layer = *block_layer_ptr;
-
+    auto test_dilation = [](auto& sample_layer, auto& block_layer, int dilation) {
         // Set random-ish weights
         std::vector<std::vector<std::vector<TestType>>> weights(channels);
         for (int i = 0; i < channels; ++i)
@@ -466,8 +518,8 @@ TEST(TestWaveNetComparison, forwardBlockMatchesForwardWithVariousDilations)
             weights[i].resize(channels);
             for (int j = 0; j < channels; ++j)
             {
-                weights[i][j].resize(kernel);
-                for (int k = 0; k < kernel; ++k)
+                weights[i][j].resize(3);
+                for (int k = 0; k < 3; ++k)
                 {
                     weights[i][j][k] = 0.1 * std::sin(i * 1.1 + j * 0.7 + k * 0.3 + dilation * 0.5);
                 }
@@ -499,10 +551,13 @@ TEST(TestWaveNetComparison, forwardBlockMatchesForwardWithVariousDilations)
         std::vector<TestType> sample_output(block_size * channels);
         for (int s = 0; s < block_size; ++s)
         {
-            Eigen::Map<const Eigen::Matrix<TestType, channels, 1>> in_vec(input_block.data() + s * channels);
-            sample_layer.forward(in_vec);
+            TestType input[channels];
             for (int c = 0; c < channels; ++c)
-                sample_output[s * channels + c] = sample_layer.outs(c);
+                input[c] = input_block[s * channels + c];
+
+            callForward<std::remove_reference_t<decltype(sample_layer)>, channels>(sample_layer, input);
+            for (int c = 0; c < channels; ++c)
+                sample_output[s * channels + c] = getOut(sample_layer, c);
         }
 
         // Process block
@@ -519,30 +574,30 @@ TEST(TestWaveNetComparison, forwardBlockMatchesForwardWithVariousDilations)
 
     // Test dilation 1
     {
-        WaveNetLayerT<TestType, channels, kernel, 1, WaveNetActivation::Tanh, true, false> sample_layer;
-        WaveNetLayerT<TestType, channels, kernel, 1, WaveNetActivation::Tanh, true, false> block_layer;
-        test_dilation(&sample_layer, &block_layer, 1);
+        WaveNetLayerT<TestType, channels, 3, 1, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, 3, 1, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(sample_layer, block_layer, 1);
     }
 
     // Test dilation 2
     {
-        WaveNetLayerT<TestType, channels, kernel, 2, WaveNetActivation::Tanh, true, false> sample_layer;
-        WaveNetLayerT<TestType, channels, kernel, 2, WaveNetActivation::Tanh, true, false> block_layer;
-        test_dilation(&sample_layer, &block_layer, 2);
+        WaveNetLayerT<TestType, channels, 3, 2, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, 3, 2, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(sample_layer, block_layer, 2);
     }
 
     // Test dilation 4
     {
-        WaveNetLayerT<TestType, channels, kernel, 4, WaveNetActivation::Tanh, true, false> sample_layer;
-        WaveNetLayerT<TestType, channels, kernel, 4, WaveNetActivation::Tanh, true, false> block_layer;
-        test_dilation(&sample_layer, &block_layer, 4);
+        WaveNetLayerT<TestType, channels, 3, 4, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, 3, 4, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(sample_layer, block_layer, 4);
     }
 
     // Test dilation 8
     {
-        WaveNetLayerT<TestType, channels, kernel, 8, WaveNetActivation::Tanh, true, false> sample_layer;
-        WaveNetLayerT<TestType, channels, kernel, 8, WaveNetActivation::Tanh, true, false> block_layer;
-        test_dilation(&sample_layer, &block_layer, 8);
+        WaveNetLayerT<TestType, channels, 3, 8, WaveNetActivation::Tanh, true, false> sample_layer;
+        WaveNetLayerT<TestType, channels, 3, 8, WaveNetActivation::Tanh, true, false> block_layer;
+        test_dilation(sample_layer, block_layer, 8);
     }
 }
 
