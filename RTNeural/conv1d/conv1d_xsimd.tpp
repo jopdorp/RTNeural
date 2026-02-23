@@ -81,6 +81,11 @@ Conv1DT<T, in_sizet, out_sizet, kernel_size, dilation_rate, groups, dynamic_stat
             for(int k = 0; k < v_filters_per_group; ++k)
                 weights[i][j][k] = v_type((T)0.0);
 
+    for(int j = 0; j < kernel_size; ++j)
+        for(int ic = 0; ic < in_size; ++ic)
+            for(int i = 0; i < v_out_size; ++i)
+                weights_ot[j][ic][i] = v_type((T)0.0);
+
     for(int i = 0; i < v_out_size; ++i)
         bias[i] = v_type((T)0.0);
 
@@ -110,6 +115,7 @@ void Conv1DT<T, in_sizet, out_sizet, kernel_size, dilation_rate, groups, dynamic
 template <typename T, int in_sizet, int out_sizet, int kernel_size, int dilation_rate, int groups, bool dynamic_state>
 void Conv1DT<T, in_sizet, out_sizet, kernel_size, dilation_rate, groups, dynamic_state>::setWeights(const std::vector<std::vector<std::vector<T>>>& ws)
 {
+    // Original per-output-channel weights (used by groups>1 overload)
     for(int i = 0; i < out_size; ++i)
     {
         for(int k = 0; k < filters_per_group; ++k)
@@ -118,6 +124,24 @@ void Conv1DT<T, in_sizet, out_sizet, kernel_size, dilation_rate, groups, dynamic
             {
                 auto& w = weights[i][j][k / v_size];
                 w = set_value(w, k % v_size, ws[i][k][j]);
+            }
+        }
+    }
+
+    // Transposed weights for output-parallel computation (groups==1 only):
+    // weights_ot[kernel_pos][in_channel][out_simd_group]
+    // Each v_type spans v_size consecutive output channels.
+    if(groups == 1)
+    {
+        for(int j = 0; j < kernel_size; ++j)
+        {
+            for(int ic = 0; ic < in_size; ++ic)
+            {
+                for(int oc = 0; oc < out_size; ++oc)
+                {
+                    auto& wv = weights_ot[j][ic][oc / v_size];
+                    wv = set_value(wv, oc % v_size, ws[oc][ic][j]);
+                }
             }
         }
     }
