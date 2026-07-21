@@ -275,7 +275,7 @@ public:
         // set state pointers to particular columns of the buffer
         setStatePointers();
 
-        if(use_output_parallel)
+        RTNEURAL_IF_CONSTEXPR(use_output_parallel)
         {
             for(int i = 0; i < v_out_size; ++i)
                 outs[i] = bias[i];
@@ -338,7 +338,7 @@ public:
         // set state pointers to particular columns of the buffer
         setStatePointers();
 
-        if(use_output_parallel)
+        RTNEURAL_IF_CONSTEXPR(use_output_parallel)
         {
             for(int i = 0; i < v_out_size; ++i)
                 outs[i] = bias[i];
@@ -392,7 +392,7 @@ public:
     RTNEURAL_REALTIME inline typename std::enable_if<DR == 1 && KS == 1 && G == 1, void>::type
     forward(const v_type (&ins)[v_in_size]) noexcept
     {
-        if(use_output_parallel)
+        RTNEURAL_IF_CONSTEXPR(use_output_parallel)
         {
             for(int i = 0; i < v_out_size; ++i)
                 outs[i] = bias[i];
@@ -465,9 +465,15 @@ private:
     template <int DS = dynamic_state>
     typename std::enable_if<!DS, void>::type resize_state() { }
 
+    // Output-parallel computation is beneficial when at least one matrix
+    // dimension fits in a single SIMD register. Larger matrices retain the
+    // input-parallel kernel to avoid extra scalar broadcasts.
+    static constexpr bool use_output_parallel = groups == 1 && (v_in_size == 1 || v_out_size == 1);
+
     using state_col_type = std::array<v_type, v_in_size>;
     using state_type = typename std::conditional<dynamic_state, std::vector<state_col_type, xsimd::aligned_allocator<state_col_type>>, std::array<state_col_type, state_size>>::type;
     using weights_type = std::array<std::array<v_type, v_filters_per_group>, kernel_size>;
+    using weights_storage_type = std::array<weights_type, use_output_parallel ? 0 : out_size>;
 
     state_type state {};
     weights_type state_cols {};
@@ -475,13 +481,8 @@ private:
     int state_ptr = 0;
     std::array<int, kernel_size> state_ptrs {};
 
-    weights_type weights[out_size] {};
+    weights_storage_type weights {};
     v_type bias[v_out_size] {};
-
-    // Output-parallel computation is beneficial when at least one matrix
-    // dimension fits in a single SIMD register. Larger matrices retain the
-    // input-parallel kernel to avoid extra scalar broadcasts.
-    static constexpr bool use_output_parallel = groups == 1 && (v_in_size == 1 || v_out_size == 1);
 
     // Transposed weights for output-parallel computation.
     // weights_ot[kernel_pos][in_channel][out_simd_group]
